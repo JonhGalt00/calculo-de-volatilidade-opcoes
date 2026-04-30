@@ -1,0 +1,394 @@
+import yfinance as yf
+import pandas as pd
+from scipy.stats import norm
+from scipy.optimize import brentq
+import numpy as np
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONTROLE — ligue (True) ou desligue (False) cada seção
+# ══════════════════════════════════════════════════════════════════════════════
+
+RODAR_ANALISE_ATIVO     = True  # estatísticas, volatilidade e diagnóstico
+RODAR_CADEIA_OPCOES     = True  # IV de múltiplas opções ao mesmo tempo
+USAR_DIVIDENDOS         = True   #Black-Scholes com dividendos (Merton)
+                                 # False = Black-Scholes padrão (q=0)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONFIGURAÇÕES DO ATIVO
+# ══════════════════════════════════════════════════════════════════════════════
+
+ATIVO = "PETR4.SA"
+DATA_INICIO = "2023-01-01"
+DATA_FIM = "2026-04-28"
+LIMITE_MOVIMENTO_FORTE = 0.02
+JANELA_ROLLING = 21
+DIAS_ANO = 252
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CADEIA DE OPÇÕES
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_selic():
+    try:
+        import requests
+        url = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.11/dados/ultimos/1?formato=json"
+        resp = requests.get(url, timeout=5)
+        selic_diaria = float(resp.json()[0]["valor"].replace(",", "."))
+        return (1 + selic_diaria / 100) ** 252 - 1
+    except Exception:
+        print("⚠️  Não foi possível buscar a Selic — usando valor fixo de fallback (14.65%)")
+        return 0.1465
+
+r = get_selic()  # taxa Selic anual em decimal, buscada automaticamente via API do Banco Central
+                 # q calculado automaticamente via yfinance (bloco abaixo)
+
+#444; 447; 449; 452; 454; 457; 459  /   487; 489; 492; 494; 497; 499; 502
+
+DIAS_VENCIMENTO = 54  # dias corridos até o vencimento (mesmo para todas as opções)
+
+CADEIA = pd.DataFrame({
+    "strike": [43.94, 44.19, 44.44, 44.69, 44.94, 45.19, 45.44, 48.19, 48.44, 48.69, 48.94, 49.19, 49.44, 49.69],
+    "preco":  [0.89, 0.94, 1.01, 1.09, 1.14, 1.23, 1.31, 2.5, 2.36, 2.29, 2.17, 2.2, 2.07, 1.69],
+    "tipo":   ["p", "p", "p", "p", "p", "p", "p", "c", "c", "c", "c", "c", "c", "c"],
+    "dias":   DIAS_VENCIMENTO
+})
+
+# converte 'p' → 'put' e 'c' → 'call'
+CADEIA["tipo"] = CADEIA["tipo"].map({"p": "put", "c": "call"}).fillna(CADEIA["tipo"])
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DOWNLOAD DOS DADOS
+# ══════════════════════════════════════════════════════════════════════════════
+
+df = yf.download(ATIVO, start=DATA_INICIO, end=DATA_FIM)
+
+S = df["Close"].iloc[-1].item()
+
+# ── Dividend yield calculado automaticamente via yfinance ─────────────────────
+# Soma todos os proventos (dividendos + JCP) distribuídos nos últimos 365 dias
+# e divide pelo preço atual para obter o yield anualizado
+
+ticker     = yf.Ticker(ATIVO)
+dividendos = ticker.dividends
+div_12m = dividendos[dividendos.index >= dividendos.index.max() - pd.Timedelta(days=365)].sum()
+q          = div_12m / S if S > 0 else 0.0
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CÁLCULOS BASE — sempre executados, independente das seções ligadas
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Estimador de Yang-Zhang (Open/High/Low/Close)
+# Trata explicitamente gaps overnight (Close[t-1] → Open[t]) e movimentos de abertura
+# Combina 3 componentes: variância overnight, variância open-to-close e Rogers-Satchell
+# k ótimo minimiza o erro de estimação: k = 0.34 / (1.34 + (n+1)/(n-1))
+# .clip(lower=0) descarta variâncias negativas espúrias por arredondamento
+
+df["retorno"] = df["Close"].pct_change()
+df = df.dropna()
+
+def hv_yang_zhang(janela):
+    n = janela
+
+    # gap overnight: retorno do Close[t-1] para Open[t]
+    log_open  = np.log(df["Open"] / df["Close"].shift(1))
+    # retorno open-to-close
+    log_close = np.log(df["Close"] / df["Open"])
+
+    # Rogers-Satchell: componente intraday puro (sem overnight)
+    rs = (
+        np.log(df["High"] / df["Close"]) * np.log(df["High"] / df["Open"])
+        + np.log(df["Low"]  / df["Close"]) * np.log(df["Low"]  / df["Open"])
+    )
+
+    k = 0.34 / (1.34 + (n + 1) / (n - 1))
+
+    var_open  = log_open.rolling(n).var()
+    var_close = log_close.rolling(n).var()
+    var_rs    = rs.rolling(n).mean()
+
+    yz = (var_open + k * var_close + (1 - k) * var_rs).clip(lower=0)
+    return yz ** 0.5 * (DIAS_ANO ** 0.5)
+
+# ── cálculos extras — só necessários se RODAR_ANALISE_ATIVO = True ────────────
+
+df["variacao_intraday"] = (df["Close"] - df["Open"]) / df["Open"]
+df["vol_diaria"]        = hv_yang_zhang(JANELA_ROLLING) / (DIAS_ANO ** 0.5)
+df["vol_anual"]         = hv_yang_zhang(JANELA_ROLLING)
+df["movimento_forte"]   = df["retorno"].abs() > LIMITE_MOVIMENTO_FORTE
+
+media_intraday  = df["variacao_intraday"].mean()
+desvio_intraday = df["variacao_intraday"].std()
+
+freq_hist    = df["movimento_forte"].mean()
+freq_recente = df["movimento_forte"].tail(JANELA_ROLLING).mean()
+
+vol_hist    = df["vol_anual"].mean()
+vol_recente = df["vol_anual"].tail(JANELA_ROLLING).mean()
+vol_atual   = df["vol_anual"].iloc[-1]
+
+hv_curta = float(hv_yang_zhang(21).iloc[-1])
+hv_longa = float(hv_yang_zhang(63).iloc[-1])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FUNÇÕES
+# ══════════════════════════════════════════════════════════════════════════════
+
+def black_scholes(S, K, T, r, sigma, tipo, q=0):
+    d1 = (np.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    if tipo == "call":
+        return S * np.exp(-q * T) * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+    else:
+        return K * np.exp(-r * T) * norm.cdf(-d2) - S * np.exp(-q * T) * norm.cdf(-d1)
+
+def calcular_iv(S, K, T, r, preco_opcao, tipo, q=0):
+    objetivo = lambda sigma: black_scholes(S, K, T, r, sigma, tipo, q) - preco_opcao
+    try:
+        return brentq(objetivo, 1e-6, 3.0)
+    except ValueError:
+        return None
+
+def calcular_hv_por_prazo(dias_corridos):
+    # converte dias corridos para dias úteis e calcula HV via Yang-Zhang nessa janela
+    dias_uteis = max(5, round(dias_corridos * DIAS_ANO / 365))
+    return hv_yang_zhang(dias_uteis).iloc[-1]
+
+def classificar(row):
+    if row["iv"] is None or pd.isna(row["hv"]):
+        return "erro"
+    if row["tipo"] == "put" and row["moneyness"] < -0.105:
+        ajuste = 1.15
+    elif row["tipo"] == "call" and row["moneyness"] > 0.105:
+        ajuste = 1.15
+    else:
+        ajuste = 1.10
+    if row["iv"] > row["hv"] * ajuste:
+        return "IV mais alta que HV"
+    elif row["iv"] < row["hv"] / ajuste:
+        return "IV mais baixa que HV"
+    else:
+        return "IV próxima a HV"
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  IMPRESSÃO
+# ══════════════════════════════════════════════════════════════════════════════
+
+print(f"{'=' * 50}")
+print(f"  Análise de ativo: {ATIVO}")
+print(f"  Preço atual:      R$ {S:.2f}")
+print(f"  Dividendos 12m:   R$ {div_12m:.4f}")
+print(f"  Dividend yield:   {q * 100:.2f}%  {'(usado no modelo)' if USAR_DIVIDENDOS else '(ignorado — USAR_DIVIDENDOS=False)'}")
+print(f"{'=' * 50}")
+
+# ── Seção 1: análise do ativo ─────────────────────────────────────────────────
+
+if RODAR_ANALISE_ATIVO:
+
+    print(f"\n--- Diagnóstico de mercado ---")
+    if freq_recente > freq_hist and vol_recente > vol_hist:
+        print("🔥 Mercado em regime de alta volatilidade")
+    elif freq_recente < freq_hist and vol_recente < vol_hist:
+        print("❄️  Mercado em regime calmo")
+    else:
+        print("⚠️  Mercado em transição / indefinido")
+
+    print(f"\n--- Insight de volatilidade ---")
+    if vol_recente > vol_hist:
+        print("Volatilidade acima do normal → opções podem estar mais caras")
+    else:
+        print("Volatilidade abaixo do normal → opções podem estar mais baratas")
+
+# ── Seção 2: cadeia de opções ─────────────────────────────────────────────────
+
+if RODAR_CADEIA_OPCOES:
+    CADEIA["T"]          = CADEIA["dias"] / 365
+    CADEIA["r_ajustado"] = CADEIA["T"].apply(lambda T: (1 + r) ** T - 1)
+    CADEIA["hv"]         = CADEIA["dias"].apply(calcular_hv_por_prazo)
+    CADEIA["iv"] = CADEIA.apply(
+        lambda row: calcular_iv(S, row["strike"], row["T"], row["r_ajustado"], row["preco"], row["tipo"],
+                                q if USAR_DIVIDENDOS else 0),
+        axis=1
+    )
+    CADEIA["moneyness"]     = np.log(S / CADEIA["strike"])
+    CADEIA["classificacao"] = CADEIA.apply(classificar, axis=1)
+
+    media_iv                = CADEIA["iv"].median()
+    CADEIA["iv_relativa"]   = CADEIA["iv"] / media_iv
+    CADEIA["score"]         = CADEIA["iv"] / CADEIA["hv"]
+
+    def sinal_score(score):
+        if score > 1.2:
+            return "║ forte venda de vol║"
+        elif score < 0.8:
+            return "║forte compra de vol║"
+        else:
+            return "║             neutro║"
+
+    CADEIA["sinal"] = CADEIA["score"].apply(sinal_score)
+
+    def regime_iv(iv):
+        if iv > hv_curta and iv > hv_longa:
+            return "IV > HV curta e longa → vol elevada nos dois horizontes"
+        elif iv > hv_curta and iv <= hv_longa:
+            return "IV > HV curta mas ≤ HV longa → vol elevada no curto prazo"
+        elif iv <= hv_curta and iv > hv_longa:
+            return "IV ≤ HV curta mas > HV longa → vol comprimida no curto prazo"
+        else:
+            return "IV < HV curta e longa → vol abaixo dos dois horizontes"
+        
+    CADEIA["regime_hv"] = np.select(
+    [
+        (CADEIA["iv"] > hv_curta) & (CADEIA["iv"] > hv_longa),
+        (CADEIA["iv"] > hv_curta) & (CADEIA["iv"] <= hv_longa),
+        (CADEIA["iv"] <= hv_curta) & (CADEIA["iv"] > hv_longa),
+    ],
+    [
+        "IV > HV curta e longa",
+        "IV > HV curta",
+        "IV > HV longa",
+    ],
+    default="IV < HV"
+)
+
+    CADEIA        = CADEIA.dropna(subset=["iv", "hv"])
+    cadeia_sorted = CADEIA.sort_values("strike")
+
+    puts  = cadeia_sorted[cadeia_sorted["tipo"] == "put"]
+    calls = cadeia_sorted[cadeia_sorted["tipo"] == "call"]
+
+    def calcular_skew(grupo):
+        if len(grupo) < 2:
+            return None, None, None
+        x          = grupo["moneyness"].values
+        y          = grupo["iv"].values
+        coef       = np.polyfit(x, y, 1)
+        skew_slope = coef[0]
+
+        eh_smile = False
+        if len(grupo) >= 5:
+            meio        = grupo["iv"].iloc[len(grupo) // 2]
+            iv_extremos = (grupo["iv"].iloc[0] + grupo["iv"].iloc[-1]) / 2
+            eh_smile    = meio < iv_extremos * 0.95
+
+        if eh_smile:
+            tipo_skew = "smile (ATM mais barato que as pontas)"
+        elif abs(skew_slope) < 0.02:
+            tipo_skew = "flat"
+        elif skew_slope < -0.05:
+            tipo_skew = "negativo (put skew)"
+        elif skew_slope > 0.05:
+            tipo_skew = "positivo (call skew)"
+        else:
+            tipo_skew = "leve"
+
+        return skew_slope, tipo_skew, eh_smile
+
+    skew_slope_puts,  tipo_skew_puts,  _ = calcular_skew(puts)
+    skew_slope_calls, tipo_skew_calls, _ = calcular_skew(calls)
+
+    print(f"\n--- Cadeia de opções — IV e classificação ---\n")
+    print(f"Modelo:               {'Black-Scholes-Merton (q={:.2%})'.format(q) if USAR_DIVIDENDOS else 'Black-Scholes padrão (sem dividendos)'}")
+    print(f"IV mediana da cadeia: {media_iv * 100:.2f}%")
+    print(f"HV curta (21d):       {hv_curta * 100:.2f}%")
+    print(f"HV longa (63d):       {hv_longa * 100:.2f}%\n")
+    resumo = CADEIA[["tipo", "strike", "dias", "r_ajustado", "preco", "hv", "iv", "iv_relativa", "score", "moneyness", "classificacao", "sinal", "regime_hv"]].copy()
+    resumo["r_ajustado"] = resumo["r_ajustado"].apply(lambda x: f"{x * 100:.3f}%")
+    resumo["hv"]          = resumo["hv"].apply(lambda x: f"{x * 100:.2f}%")
+    resumo["iv"]          = resumo["iv"].apply(lambda x: f"{x * 100:.2f}%" if x is not None else "erro")
+    resumo["iv_relativa"] = resumo["iv_relativa"].apply(lambda x: f"{x:.3f}")
+    resumo["score"]       = resumo["score"].apply(lambda x: f"{x:.3f}")
+    resumo["moneyness"]   = resumo["moneyness"].apply(lambda x: f"{x:.3f}")
+    print(resumo.to_string(index=False))
+
+    if len(cadeia_sorted) >= 2:             
+        print(f"\n--- Skew de volatilidade ---")
+
+        if skew_slope_puts is not None:
+            print(f"\n  PUTS")
+            print(f"  IV strike mais baixo (R$ {puts['strike'].iloc[0]:.2f}):  {puts['iv'].iloc[0] * 100:.2f}%")
+            print(f"  IV strike mais alto  (R$ {puts['strike'].iloc[-1]:.2f}):  {puts['iv'].iloc[-1] * 100:.2f}%")
+            print(f"  Slope:  {skew_slope_puts:.4f}  (negativo = put skew, positivo = call skew)")
+            print(f"  Tipo:   {tipo_skew_puts}")
+        else:
+            print("\n  PUTS — menos de 2 strikes, skew não calculado.")
+
+        if skew_slope_calls is not None:
+            print(f"\n  CALLS")
+            print(f"  IV strike mais baixo (R$ {calls['strike'].iloc[0]:.2f}):  {calls['iv'].iloc[0] * 100:.2f}%")
+            print(f"  IV strike mais alto  (R$ {calls['strike'].iloc[-1]:.2f}):  {calls['iv'].iloc[-1] * 100:.2f}%")
+            print(f"  Slope:  {skew_slope_calls:.4f}  (negativo = put skew, positivo = call skew)")
+            print(f"  Tipo:   {tipo_skew_calls}")
+        else:
+            print("\n  CALLS — menos de 2 strikes, skew não calculado.")
+
+        print(f"\n--- Interpretação do skew para operações ---")
+        for tipo_skew in set(filter(None, [tipo_skew_puts, tipo_skew_calls])):
+            if tipo_skew == "negativo (put skew)":
+                print("Puts OTM estão mais caras que calls OTM.")
+                print("→ Mercado pagando prêmio por proteção de queda.")
+                print("→ Venda de puts OTM pode ser atrativa (prêmio elevado).")
+                print("→ Spreads de baixa (bear spread) tendem a ser mais caros.")
+                print("→ Estruturas como risk reversal favorecem venda de put + compra de call.")
+            elif tipo_skew == "positivo (call skew)":
+                print("Calls OTM estão mais caras que puts OTM.")
+                print("→ Mercado precificando mais risco de alta do que de queda.")
+                print("→ Pode indicar expectativa de movimento brusco para cima (evento, resultado).")
+                print("→ Venda de calls OTM pode ser atrativa.")
+                print("→ Risk reversal invertido: venda de call + compra de put.")
+            elif tipo_skew == "smile (ATM mais barato que as pontas)":
+                print("IV mais alta nas pontas (OTM) e mais baixa no ATM.")
+                print("→ Mercado precificando risco de movimento forte em qualquer direção.")
+                print("→ Estratégias de compra de volatilidade (straddle, strangle) podem ser interessantes.")
+                print("→ Venda de borboleta (butterfly) pode capturar o prêmio das pontas.")
+            elif tipo_skew == "flat":
+                print("IV aproximadamente igual em todos os strikes.")
+                print("→ Mercado sem viés direcional claro.")
+                print("→ Sem vantagem estrutural clara por skew — avaliar HV vs IV.")
+            elif tipo_skew == "leve":
+                print("Skew leve — inclinação existe mas não é pronunciada.")
+                print("→ Tendência de put skew fraco: proteção levemente mais cara.")
+                print("→ Sem sinal operacional forte apenas pelo skew.")
+    else:
+        print("\n⚠️  Skew requer ao menos 2 opções com strikes diferentes na cadeia.")
+
+    # ── Spreads verticais entre strikes adjacentes ────────────────────────────
+
+    if len(CADEIA) >= 2:
+        print(f"\n--- Spreads verticais (strikes adjacentes) ---\n")
+
+        for i in range(len(CADEIA) - 1):
+            s1 = CADEIA.iloc[i]
+            s2 = CADEIA.iloc[i + 1]
+
+            if s1["tipo"] != s2["tipo"]:
+                continue
+
+            if s1["tipo"] == "put":
+                vendido  = max(s1, s2, key=lambda x: x["strike"])
+                comprado = min(s1, s2, key=lambda x: x["strike"])
+                nome_spread = "bull put spread"
+            elif s1["tipo"] == "call":
+                vendido  = min(s1, s2, key=lambda x: x["strike"])
+                comprado = max(s1, s2, key=lambda x: x["strike"])
+                nome_spread = "bear call spread"
+
+            credito = vendido["preco"] - comprado["preco"]
+            largura = abs(vendido["strike"] - comprado["strike"])
+            risco   = largura - credito
+            ratio   = credito / risco if risco > 0 else None
+
+            if ratio is None:
+                interpretacao = "risco inválido — verifique os preços"
+            elif ratio >= 0.40:
+                interpretacao = "bom → crédito alto em relação ao risco"
+            elif ratio >= 0.25:
+                interpretacao = "neutro → relação razoável"
+            else:
+                interpretacao = "ruim → crédito baixo para o risco assumido"
+
+            print(f"  {nome_spread}: vende R$ {vendido['strike']:.2f} / compra R$ {comprado['strike']:.2f}")
+            print(f"  Crédito:       R$ {credito:.2f}")
+            print(f"  Risco máximo:  R$ {risco:.2f}")
+            print(f"  Ratio c/r:     {f'{ratio:.3f}' if ratio is not None else 'N/A'}  → {interpretacao}")
+            print()
